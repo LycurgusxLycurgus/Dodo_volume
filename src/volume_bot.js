@@ -1,109 +1,88 @@
 const PumpPortalClient = require('./pump_portal');
-const RaydiumPortalClient = require('./raydium_portal');
+const JupiterPortalClient = require('./jupiter_portal');
 const logger = require('./logger');
 const EventEmitter = require('events');
 
 class VolumeBot extends EventEmitter {
     constructor(config = {}) {
         super();
-        this.pumpPortal = new PumpPortalClient();
-        this.raydiumPortal = new RaydiumPortalClient();
         
-        // Bot configuration
+        // Validate required configuration
+        if (!config.privateKey) {
+            throw new Error('Private key is required');
+        }
+
+        // Default RPC endpoint
+        const defaultRpcEndpoint = 'https://api.mainnet-beta.solana.com';
+
         this.config = {
             targetVolume: config.targetVolume || 1000, // Target volume in USD
             minTradeSize: config.minTradeSize || 10,   // Minimum trade size in USD
             maxTradeSize: config.maxTradeSize || 100,  // Maximum trade size in USD
             tradeInterval: config.tradeInterval || 60000, // Time between trades in ms
-            slippageTolerance: config.slippageTolerance || 0.01, // 1% slippage tolerance
+            baseToken: config.baseToken || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC mint address
+            baseTokenDecimals: config.baseTokenDecimals || 6,
+            privateKey: config.privateKey,
+            platform: config.platform || 'jupiter', // Default to Jupiter
+            publicKey: config.publicKey, // Required for PumpPortal
+            rpcEndpoint: config.rpcEndpoint || defaultRpcEndpoint,
             ...config
         };
+
+        // Initialize appropriate trading portal
+        if (this.config.platform === 'pump') {
+            this.pumpPortal = new PumpPortalClient({
+                rpcEndpoint: this.config.rpcEndpoint || defaultRpcEndpoint
+            });
+            this.jupiterPortal = null;
+        } else {
+            this.pumpPortal = null;
+            this.jupiterPortal = new JupiterPortalClient({
+                rpcEndpoint: config.jupiter?.rpcEndpoint || this.config.rpcEndpoint,
+                slippageBps: config.jupiter?.slippageBps || 50,
+                priorityFeeAmount: config.jupiter?.priorityFeeAmount || 100000,
+                maxSlippageBps: config.jupiter?.maxSlippageBps || 300
+            });
+        }
 
         // Trading state
         this.activeTokens = new Map(); // token address -> trading state
         this.isRunning = false;
-        this.currentVolume = 0;
     }
 
     async connect() {
         try {
             logger.info('Connecting to trading portals...');
-            await Promise.all([
-                this.pumpPortal.connect(),
-                this.raydiumPortal.connect()
-            ]);
-            logger.info('Successfully connected to all trading portals');
+            
+            if (this.config.platform === 'pump') {
+                await this.pumpPortal.connect();
+            } else {
+                await this.jupiterPortal.connect(this.config.privateKey);
+            }
+
+            logger.info('Successfully connected to trading portals');
             return true;
         } catch (error) {
             logger.error('Failed to connect:', error);
-            return false;
+            throw error;
         }
     }
 
-    async startVolumeBot(tokenAddress, platform = 'pump') {
+    async startVolumeBot(tokenAddress) {
         if (!this.isRunning) {
             this.isRunning = true;
-            logger.info(`Starting volume bot for token ${tokenAddress} on ${platform}`);
+            logger.info(`Starting volume bot for token ${tokenAddress}`);
 
             // Initialize token state
             this.activeTokens.set(tokenAddress, {
                 currentVolume: 0,
                 lastTradeTime: 0,
-                platform,
                 trades: []
             });
-
-            // Start monitoring trades
-            await this._monitorTokenTrades(tokenAddress, platform);
             
             // Start volume management loop
             this._startVolumeManagement(tokenAddress);
         }
-    }
-
-    async _monitorTokenTrades(tokenAddress, platform) {
-        if (platform === 'pump') {
-            await this.pumpPortal.subscribeTokenTrade([tokenAddress]);
-            this.pumpPortal.addCallback('token_trade', (data) => {
-                this._handleTrade(tokenAddress, data);
-            });
-        } else if (platform === 'raydium') {
-            await this.raydiumPortal.monitorTokenTransactions(tokenAddress, (data) => {
-                this._handleTrade(tokenAddress, data);
-            });
-        }
-    }
-
-    _handleTrade(tokenAddress, tradeData) {
-        const tokenState = this.activeTokens.get(tokenAddress);
-        if (!tokenState) return;
-
-        // Update volume tracking
-        const tradeVolume = this._calculateTradeVolume(tradeData);
-        tokenState.currentVolume += tradeVolume;
-        tokenState.trades.push({
-            timestamp: Date.now(),
-            volume: tradeVolume
-        });
-
-        // Clean up old trades (older than 24h)
-        const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-        tokenState.trades = tokenState.trades.filter(trade => trade.timestamp > oneDayAgo);
-
-        // Recalculate current 24h volume
-        tokenState.currentVolume = tokenState.trades.reduce((sum, trade) => sum + trade.volume, 0);
-
-        this.emit('trade', {
-            tokenAddress,
-            tradeVolume,
-            currentVolume: tokenState.currentVolume
-        });
-    }
-
-    _calculateTradeVolume(tradeData) {
-        // TODO: Implement actual volume calculation based on trade data
-        // This will differ between Pump and Raydium platforms
-        return 0; // Placeholder
     }
 
     async _startVolumeManagement(tokenAddress) {
@@ -115,7 +94,7 @@ class VolumeBot extends EventEmitter {
                 const volumeNeeded = this.config.targetVolume - tokenState.currentVolume;
                 
                 if (volumeNeeded > 0) {
-                    await this._executeVolumeTrade(tokenAddress, volumeNeeded, tokenState.platform);
+                    await this._executeVolumeTrade(tokenAddress, volumeNeeded);
                 }
 
                 // Wait for next interval
@@ -127,19 +106,53 @@ class VolumeBot extends EventEmitter {
         }
     }
 
-    async _executeVolumeTrade(tokenAddress, volumeNeeded, platform) {
+    async _executeVolumeTrade(tokenAddress, volumeNeeded) {
         const tradeSize = this._calculateTradeSize(volumeNeeded);
         
         try {
-            if (platform === 'pump') {
-                await this._executePumpTrade(tokenAddress, tradeSize);
-            } else if (platform === 'raydium') {
-                await this._executeRaydiumTrade(tokenAddress, tradeSize);
+            let txid;
+            if (this.config.platform === 'pump') {
+                if (!this.config.publicKey) {
+                    throw new Error('Public key is required for PumpPortal trades');
+                }
+
+                // Execute trade using PumpPortal
+                txid = await this.pumpPortal.executeTrade({
+                    publicKey: this.config.publicKey,
+                    action: "buy",
+                    mint: tokenAddress,
+                    denominatedInSol: "false",
+                    amount: tradeSize * (10 ** this.config.baseTokenDecimals),
+                    slippage: 10,
+                    priorityFee: 0.00001,
+                    pool: "pump"
+                });
+            } else {
+                // Execute trade using Jupiter
+                const quote = await this.jupiterPortal.getQuote(
+                    this.config.baseToken,
+                    tokenAddress,
+                    tradeSize * (10 ** this.config.baseTokenDecimals)
+                );
+                txid = await this.jupiterPortal.executeSwap(quote);
             }
+
+            logger.info(`Executed trade for ${tradeSize} USD, txid: ${txid}`);
             
-            logger.info(`Executed trade for ${tradeSize} USD on ${platform}`);
+            // Update volume tracking
+            const tokenState = this.activeTokens.get(tokenAddress);
+            tokenState.currentVolume += tradeSize;
+            tokenState.lastTradeTime = Date.now();
+            tokenState.trades.push({
+                timestamp: Date.now(),
+                volume: tradeSize,
+                txid
+            });
+
+            return txid;
         } catch (error) {
             logger.error(`Failed to execute trade: ${error.message}`);
+            throw error;
         }
     }
 
@@ -150,33 +163,10 @@ class VolumeBot extends EventEmitter {
         return minSize + Math.random() * (maxSize - minSize);
     }
 
-    async _executePumpTrade(tokenAddress, tradeSize) {
-        // TODO: Implement PumpPortal trading logic
-        // This will be implemented once the API details are available
-        logger.info(`[PLACEHOLDER] Executing Pump trade for ${tradeSize} USD`);
-    }
-
-    async _executeRaydiumTrade(tokenAddress, tradeSize) {
-        try {
-            // TODO: Implement Raydium trading logic using SDK
-            logger.info(`[PLACEHOLDER] Executing Raydium trade for ${tradeSize} USD`);
-        } catch (error) {
-            throw new Error(`Raydium trade failed: ${error.message}`);
-        }
-    }
-
     async stopVolumeBot(tokenAddress) {
         const tokenState = this.activeTokens.get(tokenAddress);
         if (tokenState) {
             this.isRunning = false;
-            
-            // Cleanup subscriptions
-            if (tokenState.platform === 'pump') {
-                await this.pumpPortal.unsubscribeTokenTrade([tokenAddress]);
-            } else if (tokenState.platform === 'raydium') {
-                await this.raydiumPortal.stopMonitoring('token', tokenAddress);
-            }
-            
             this.activeTokens.delete(tokenAddress);
             logger.info(`Stopped volume bot for ${tokenAddress}`);
         }
@@ -187,10 +177,14 @@ class VolumeBot extends EventEmitter {
         for (const tokenAddress of this.activeTokens.keys()) {
             await this.stopVolumeBot(tokenAddress);
         }
-        await Promise.all([
-            this.pumpPortal.close(),
-            this.raydiumPortal.close()
-        ]);
+        
+        if (this.pumpPortal) {
+            await this.pumpPortal.close();
+        }
+        if (this.jupiterPortal) {
+            await this.jupiterPortal.close();
+        }
+
         logger.info('Volume bot closed');
     }
 }

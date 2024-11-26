@@ -1,11 +1,22 @@
 const WebSocket = require('ws');
+const { VersionedTransaction, Connection, Keypair } = require('@solana/web3.js');
 const EventEmitter = require('events');
 const logger = require('./logger');
+const bs58 = require('bs58');
+const fetch = require('cross-fetch');
 
 class PumpPortalClient extends EventEmitter {
-    constructor() {
+    constructor(config = {}) {
         super();
-        this.uri = "wss://pumpportal.fun/api/data";
+        this.config = {
+            rpcEndpoint: config.rpcEndpoint || 'https://api.mainnet-beta.solana.com',
+            wsEndpoint: 'wss://pumpportal.fun/api/data',
+            tradeEndpoint: 'https://pumpportal.fun/api/trade-local',
+            jitoEndpoint: 'https://mainnet.block-engine.jito.wtf/api/v1/bundles',
+            ...config
+        };
+        
+        this.connection = new Connection(this.config.rpcEndpoint, 'confirmed');
         this.ws = null;
         this.isConnected = false;
         this.subscribedTokens = new Set();
@@ -32,7 +43,10 @@ class PumpPortalClient extends EventEmitter {
         this.connectionPromise = new Promise((resolve, reject) => {
             try {
                 logger.info('Connecting to PumpPortal...');
-                this.ws = new WebSocket(this.uri);
+                this.ws = new WebSocket(this.config.wsEndpoint, {
+                    handshakeTimeout: 30000,
+                    perMessageDeflate: false
+                });
 
                 this.ws.on('open', () => {
                     logger.info('Connected to PumpPortal WebSocket');
@@ -77,6 +91,107 @@ class PumpPortalClient extends EventEmitter {
         return this.connectionPromise;
     }
 
+    async executeTrade(params) {
+        try {
+            const response = await fetch(this.config.tradeEndpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(params)
+            });
+
+            if (response.status !== 200) {
+                throw new Error(`Trade request failed: ${response.statusText}`);
+            }
+
+            const data = await response.arrayBuffer();
+            const tx = VersionedTransaction.deserialize(new Uint8Array(data));
+            
+            if (!this.config.signerKeyPair) {
+                throw new Error('Signer keypair not configured');
+            }
+
+            tx.sign([this.config.signerKeyPair]);
+            const signature = await this.connection.sendTransaction(tx);
+            
+            logger.info(`Transaction sent: https://solscan.io/tx/${signature}`);
+            return signature;
+        } catch (error) {
+            logger.error('Failed to execute trade:', error);
+            throw error;
+        }
+    }
+
+    async executeTradeBundle(bundleParams) {
+        try {
+            // Validate bundle parameters
+            if (!Array.isArray(bundleParams) || bundleParams.length === 0 || bundleParams.length > 5) {
+                throw new Error('Bundle must contain between 1 and 5 transactions');
+            }
+
+            // Get transactions from PumpPortal
+            const response = await fetch(this.config.tradeEndpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(bundleParams)
+            });
+
+            if (response.status !== 200) {
+                throw new Error(`Bundle request failed: ${response.statusText}`);
+            }
+
+            const transactions = await response.json();
+            let encodedSignedTransactions = [];
+            let signatures = [];
+
+            // Sign each transaction
+            for (let i = 0; i < bundleParams.length; i++) {
+                const tx = VersionedTransaction.deserialize(new Uint8Array(bs58.decode(transactions[i])));
+                const signerKeyPair = this.config.bundleSigners[i];
+                
+                if (!signerKeyPair) {
+                    throw new Error(`No signer configured for transaction ${i}`);
+                }
+
+                tx.sign([signerKeyPair]);
+                encodedSignedTransactions.push(bs58.encode(tx.serialize()));
+                signatures.push(bs58.encode(tx.signatures[0]));
+            }
+
+            // Send bundle to Jito
+            const jitoResponse = await fetch(this.config.jitoEndpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'sendBundle',
+                    params: [encodedSignedTransactions]
+                })
+            });
+
+            if (!jitoResponse.ok) {
+                throw new Error(`Jito bundle submission failed: ${jitoResponse.statusText}`);
+            }
+
+            // Log transaction signatures
+            signatures.forEach((sig, i) => {
+                logger.info(`Transaction ${i}: https://solscan.io/tx/${sig}`);
+            });
+
+            return signatures;
+        } catch (error) {
+            logger.error('Failed to execute trade bundle:', error);
+            throw error;
+        }
+    }
+
+    // Existing WebSocket methods
     async _sendMessage(payload) {
         if (!this.isConnected || !this.ws) {
             throw new Error('Not connected to WebSocket');
@@ -107,23 +222,6 @@ class PumpPortalClient extends EventEmitter {
         }
     }
 
-    async subscribeAccountTrade(accountAddresses) {
-        const newAccounts = accountAddresses.filter(addr => !this.subscribedAccounts.has(addr));
-        if (newAccounts.length > 0) {
-            await this._sendMessage({
-                method: "subscribeAccountTrade",
-                keys: newAccounts
-            });
-            newAccounts.forEach(account => this.subscribedAccounts.add(account));
-            logger.info(`Subscribed to trades for accounts: ${newAccounts.join(', ')}`);
-        }
-    }
-
-    async unsubscribeNewToken() {
-        await this._sendMessage({ method: "unsubscribeNewToken" });
-        logger.info('Unsubscribed from new token events');
-    }
-
     async unsubscribeTokenTrade(tokenAddresses) {
         await this._sendMessage({
             method: "unsubscribeTokenTrade",
@@ -131,15 +229,6 @@ class PumpPortalClient extends EventEmitter {
         });
         tokenAddresses.forEach(token => this.subscribedTokens.delete(token));
         logger.info(`Unsubscribed from trades for tokens: ${tokenAddresses.join(', ')}`);
-    }
-
-    async unsubscribeAccountTrade(accountAddresses) {
-        await this._sendMessage({
-            method: "unsubscribeAccountTrade",
-            keys: accountAddresses
-        });
-        accountAddresses.forEach(account => this.subscribedAccounts.delete(account));
-        logger.info(`Unsubscribed from trades for accounts: ${accountAddresses.join(', ')}`);
     }
 
     async _handleMessage(data) {
