@@ -13,7 +13,7 @@ class VolumeBot extends EventEmitter {
         }
 
         // Default RPC endpoint
-        const defaultRpcEndpoint = 'https://api.mainnet-beta.solana.com';
+        const defaultRpcEndpoint = 'https://mainnet.helius-rpc.com/?api-key=63b3a69f-2586-470d-83ea-0267ce5248df';
 
         this.config = {
             targetVolume: config.targetVolume || 1000, // Target volume in USD
@@ -55,7 +55,7 @@ class VolumeBot extends EventEmitter {
             logger.info('Connecting to trading portals...');
             
             if (this.config.platform === 'pump') {
-                await this.pumpPortal.connect();
+                await this.pumpPortal.connect(this.config.privateKey);
             } else {
                 await this.jupiterPortal.connect(this.config.privateKey);
             }
@@ -122,7 +122,7 @@ class VolumeBot extends EventEmitter {
                     action: "buy",
                     mint: tokenAddress,
                     denominatedInSol: "false",
-                    amount: tradeSize * (10 ** this.config.baseTokenDecimals),
+                    amount: tradeSize, // Direct USD amount for PumpPortal
                     slippage: 10,
                     priorityFee: 0.00001,
                     pool: "pump"
@@ -141,13 +141,17 @@ class VolumeBot extends EventEmitter {
             
             // Update volume tracking
             const tokenState = this.activeTokens.get(tokenAddress);
-            tokenState.currentVolume += tradeSize;
-            tokenState.lastTradeTime = Date.now();
-            tokenState.trades.push({
-                timestamp: Date.now(),
-                volume: tradeSize,
-                txid
-            });
+            if (tokenState) {
+                tokenState.currentVolume += tradeSize;
+                tokenState.lastTradeTime = Date.now();
+                tokenState.trades.push({
+                    timestamp: Date.now(),
+                    volume: tradeSize,
+                    txid
+                });
+            } else {
+                logger.warn(`Token state for ${tokenAddress} not found`);
+            }
 
             return txid;
         } catch (error) {

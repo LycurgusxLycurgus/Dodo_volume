@@ -125,13 +125,42 @@ class VolumeBotTester {
                 const timeElapsed = Math.floor((Date.now() - startTime) / 1000);
                 const progress = (currentVolume / targetVolume) * 100;
 
-                logger.info(`Time: ${timeElapsed}s | Volume: $${currentVolume.toFixed(2)} | Progress: ${progress.toFixed(2)}%`);
+                // Print detailed status
+                this.printSection('Volume Test Status');
+                console.log(`Time Elapsed: ${timeElapsed}s / ${duration}s`);
+                console.log(`Current Volume: $${currentVolume.toFixed(2)}`);
+                console.log(`Progress: ${progress.toFixed(2)}%`);
+
+                // Print recent trades
+                if (tokenState && tokenState.trades.length > 0) {
+                    console.log('\nRecent Trades:');
+                    tokenState.trades.slice(-5).forEach(trade => {
+                        console.log(`- ${new Date(trade.timestamp).toISOString()}`);
+                        console.log(`  Amount: $${trade.volume.toFixed(2)}`);
+                        console.log(`  Transaction: https://solscan.io/tx/${trade.txid}`);
+                    });
+                }
+
                 await new Promise(resolve => setTimeout(resolve, 5000));
             }
 
             // Stop volume bot
             await bot.stopVolumeBot(tokenAddress);
             logger.info('Volume test completed');
+
+            // Print final summary
+            const finalTokenState = bot.activeTokens.get(tokenAddress);
+            if (finalTokenState) {
+                this.printSection('Volume Test Summary');
+                console.log(`Total Volume: $${finalTokenState.currentVolume.toFixed(2)}`);
+                console.log(`Total Trades: ${finalTokenState.trades.length}`);
+                console.log('\nAll Trades:');
+                finalTokenState.trades.forEach(trade => {
+                    console.log(`- ${new Date(trade.timestamp).toISOString()}`);
+                    console.log(`  Amount: $${trade.volume.toFixed(2)}`);
+                    console.log(`  Transaction: https://solscan.io/tx/${trade.txid}`);
+                });
+            }
 
         } catch (error) {
             logger.error('Volume test failed:', error);

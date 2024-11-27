@@ -8,12 +8,12 @@
     "test": "node src/test_volume_bot.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.87.6",
     "@project-serum/anchor": "^0.26.0",
-    "cross-fetch": "^4.0.0",
+    "@solana/web3.js": "^1.95.5",
     "bs58": "^5.0.0",
-    "ws": "^8.16.0",
+    "cross-fetch": "^4.0.0",
+    "dotenv": "^16.3.1",
     "winston": "^3.11.0",
-    "dotenv": "^16.3.1"
+    "ws": "^8.16.0"
   }
 }

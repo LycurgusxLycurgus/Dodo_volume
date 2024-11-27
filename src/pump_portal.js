@@ -13,6 +13,7 @@ class PumpPortalClient extends EventEmitter {
             wsEndpoint: 'wss://pumpportal.fun/api/data',
             tradeEndpoint: 'https://pumpportal.fun/api/trade-local',
             jitoEndpoint: 'https://mainnet.block-engine.jito.wtf/api/v1/bundles',
+            confirmationTimeout: config.confirmationTimeout || 30000, // 30 seconds
             ...config
         };
         
@@ -27,12 +28,24 @@ class PumpPortalClient extends EventEmitter {
             account_trade: []
         };
         this.connectionPromise = null;
+        this.signerKeyPair = null;
     }
 
-    async connect() {
+    async connect(privateKeyString) {
         if (this.isConnected && this.ws) {
             logger.info('Already connected to PumpPortal');
             return;
+        }
+
+        if (privateKeyString) {
+            try {
+                const privateKeyBytes = bs58.decode(privateKeyString);
+                this.signerKeyPair = Keypair.fromSecretKey(privateKeyBytes);
+                logger.info('Signer keypair configured');
+            } catch (error) {
+                logger.error('Failed to configure signer keypair:', error);
+                throw error;
+            }
         }
 
         if (this.connectionPromise) {
@@ -93,6 +106,10 @@ class PumpPortalClient extends EventEmitter {
 
     async executeTrade(params) {
         try {
+            if (!this.signerKeyPair) {
+                throw new Error('Signer keypair not configured');
+            }
+
             const response = await fetch(this.config.tradeEndpoint, {
                 method: 'POST',
                 headers: {
@@ -107,15 +124,33 @@ class PumpPortalClient extends EventEmitter {
 
             const data = await response.arrayBuffer();
             const tx = VersionedTransaction.deserialize(new Uint8Array(data));
+            tx.sign([this.signerKeyPair]);
             
-            if (!this.config.signerKeyPair) {
-                throw new Error('Signer keypair not configured');
+            // Send transaction
+            const signature = await this.connection.sendTransaction(tx);
+            logger.info(`Transaction sent: https://solscan.io/tx/${signature}`);
+
+            // Wait for confirmation
+            const confirmation = await this.connection.confirmTransaction(signature, {
+                maxRetries: 3
+            });
+
+            if (confirmation.value.err) {
+                throw new Error(`Transaction failed: ${confirmation.value.err}`);
             }
 
-            tx.sign([this.config.signerKeyPair]);
-            const signature = await this.connection.sendTransaction(tx);
+            // Get transaction details
+            const txDetails = await this.connection.getTransaction(signature, {
+                maxSupportedTransactionVersion: 0
+            });
+
+            if (!txDetails) {
+                throw new Error('Transaction details not found');
+            }
+
+            logger.info(`Transaction confirmed: ${signature}`);
+            logger.info(`Block time: ${new Date(txDetails.blockTime * 1000).toISOString()}`);
             
-            logger.info(`Transaction sent: https://solscan.io/tx/${signature}`);
             return signature;
         } catch (error) {
             logger.error('Failed to execute trade:', error);
@@ -222,6 +257,23 @@ class PumpPortalClient extends EventEmitter {
         }
     }
 
+    async subscribeAccountTrade(accountAddresses) {
+        const newAccounts = accountAddresses.filter(addr => !this.subscribedAccounts.has(addr));
+        if (newAccounts.length > 0) {
+            await this._sendMessage({
+                method: "subscribeAccountTrade",
+                keys: newAccounts
+            });
+            newAccounts.forEach(account => this.subscribedAccounts.add(account));
+            logger.info(`Subscribed to trades for accounts: ${newAccounts.join(', ')}`);
+        }
+    }
+
+    async unsubscribeNewToken() {
+        await this._sendMessage({ method: "unsubscribeNewToken" });
+        logger.info('Unsubscribed from new token events');
+    }
+
     async unsubscribeTokenTrade(tokenAddresses) {
         await this._sendMessage({
             method: "unsubscribeTokenTrade",
@@ -229,6 +281,15 @@ class PumpPortalClient extends EventEmitter {
         });
         tokenAddresses.forEach(token => this.subscribedTokens.delete(token));
         logger.info(`Unsubscribed from trades for tokens: ${tokenAddresses.join(', ')}`);
+    }
+
+    async unsubscribeAccountTrade(accountAddresses) {
+        await this._sendMessage({
+            method: "unsubscribeAccountTrade",
+            keys: accountAddresses
+        });
+        accountAddresses.forEach(account => this.subscribedAccounts.delete(account));
+        logger.info(`Unsubscribed from trades for accounts: ${accountAddresses.join(', ')}`);
     }
 
     async _handleMessage(data) {
