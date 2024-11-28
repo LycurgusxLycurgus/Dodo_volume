@@ -1,0 +1,1 @@
+// Example usage of SimpleVolumeBot - see test_simple_volume_bot.js for implementation details 

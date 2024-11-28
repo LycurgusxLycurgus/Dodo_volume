@@ -39,7 +39,7 @@ class PumpPortalSwapTester {
             amount: amountSOL.toFixed(9), // Format to 9 decimal places for precision
             denominatedInSol: "true",
             slippage: 10, // 10% slippage
-            priorityFee: 0.005,
+            priorityFee: 0.001,
             pool: "pump"
         };
 
