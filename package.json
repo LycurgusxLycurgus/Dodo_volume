@@ -8,12 +8,15 @@
     "test": "node src/test_volume_bot.js"
   },
   "dependencies": {
+    "@jup-ag/api": "^6.0.30",
     "@project-serum/anchor": "^0.26.0",
     "@solana/web3.js": "^1.95.5",
     "bs58": "^5.0.0",
     "cross-fetch": "^4.0.0",
-    "dotenv": "^16.3.1",
-    "winston": "^3.11.0",
+    "dotenv": "^16.4.5",
+    "jito-js-rpc": "^0.1.0",
+    "node-fetch": "^3.3.2",
+    "winston": "^3.17.0",
     "ws": "^8.16.0"
   }
 }
