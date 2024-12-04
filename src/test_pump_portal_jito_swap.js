@@ -5,6 +5,7 @@ const fetch = require('cross-fetch');
 const { Wallet } = require('@project-serum/anchor');
 const bs58 = require('bs58');
 const logger = require('./logger');
+const axios = require('axios');
 
 class PumpPortalJitoSwapTester {
     constructor() {
@@ -29,15 +30,119 @@ class PumpPortalJitoSwapTester {
         this.TRADE_ENDPOINT = 'https://pumpportal.fun/api/trade-local';
         this.SOL_PRICE_USD = 230; // Approximate SOL price
         this.JITO_TIP_AMOUNT = 0.0005; // 0.0005 SOL as priority fee for Jito
+
+        // Add new constants for dynamic parameters
+        this.HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
+        this.PRICE_CACHE_DURATION = 30000; // 30 seconds
+        this.lastPriceUpdate = 0;
+        this.cachedSolPrice = null;
+
+        // Update Helius endpoint constant
+        this.HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${this.HELIUS_API_KEY}`;
+    }
+
+    async getSolPriceUSD() {
+        // Return cached price if still valid
+        if (this.cachedSolPrice && (Date.now() - this.lastPriceUpdate) < this.PRICE_CACHE_DURATION) {
+            return this.cachedSolPrice;
+        }
+
+        try {
+            const response = await axios.get(
+                'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'
+            );
+            this.cachedSolPrice = response.data.solana.usd;
+            this.lastPriceUpdate = Date.now();
+            return this.cachedSolPrice;
+        } catch (error) {
+            logger.error('Failed to fetch SOL price:', error);
+            return this.SOL_PRICE_USD; // Fallback to default price
+        }
+    }
+
+    async getRecommendedPriorityFee() {
+        try {
+            const PRIORITY_LEVELS = {
+                MIN: 'Min',
+                LOW: 'Low',
+                MEDIUM: 'Medium',
+                HIGH: 'High',
+                VERY_HIGH: 'VeryHigh',
+                UNSAFE_MAX: 'UnsafeMax',
+                DEFAULT: 'Default'
+            };
+
+            const payload = {
+                jsonrpc: "2.0",
+                id: "helius-priority-fee",
+                method: "getPriorityFeeEstimate",
+                params: [{
+                    accountKeys: [this.wallet.publicKey.toString()],
+                    options: {
+                        priorityLevel: PRIORITY_LEVELS.HIGH,
+                        includeAllPriorityFeeLevels: false
+                    }
+                }]
+            };
+
+            logger.info('Sending priority fee request to Helius...');
+            const response = await axios.post(this.HELIUS_RPC_URL, payload);
+            
+            if (response.data?.result?.priorityFeeEstimate) {
+                // Convert from lamports to SOL and add 20% margin for safety
+                const recommendedFee = (response.data.result.priorityFeeEstimate / 1e9) * 1.2;
+                logger.info(`Recommended priority fee: ${recommendedFee} SOL`);
+                
+                // Ensure we return a number and use a minimum threshold
+                const finalFee = Math.max(recommendedFee, 0.0001); // Minimum 0.0001 SOL
+                logger.info(`Using priority fee: ${finalFee} SOL`);
+                return finalFee;
+            }
+            
+            logger.warn('Using fallback priority fee due to invalid response');
+            return this.JITO_TIP_AMOUNT;
+
+        } catch (error) {
+            logger.error('Failed to fetch priority fee, using fallback:', error.message);
+            return this.JITO_TIP_AMOUNT;
+        }
+    }
+
+    calculateDynamicSlippage() {
+        // Start with base slippage of 1%
+        const baseSlippage = 1;
+        
+        // Get current hour
+        const hour = new Date().getUTCHours();
+        
+        // Increase slippage during typically volatile hours (around market opens)
+        if (hour >= 13 && hour <= 15) { // Around US market open
+            return baseSlippage * 1.5;
+        } else if (hour >= 2 && hour <= 4) { // Around Asian market open
+            return baseSlippage * 1.3;
+        }
+        
+        return baseSlippage;
     }
 
     async executeBundledTrade(tokenAddress, action, amountUSD = 0.03) {
         logger.info(`Preparing bundled ${action} transaction for ${amountUSD} USD of ${tokenAddress}`);
         
-        // Convert USD to SOL (approximate)
-        const amountSOL = amountUSD / this.SOL_PRICE_USD;
+        // Get dynamic parameters
+        const solPrice = await this.getSolPriceUSD();
+        const priorityFee = await this.getRecommendedPriorityFee();
+        const dynamicSlippage = this.calculateDynamicSlippage();
         
-        // Create bundle parameters - we'll create two transactions in the bundle
+        logger.info(`Using dynamic values:`, {
+            solPrice: `$${solPrice}`,
+            priorityFee: `${priorityFee} SOL`,
+            slippage: `${dynamicSlippage}%`
+        });
+        
+        // Convert USD to SOL using current price
+        const amountSOL = amountUSD / solPrice;
+        
+        // Create bundle parameters with dynamic values
         const bundledTxArgs = [
             {
                 publicKey: this.wallet.publicKey.toString(),
@@ -45,8 +150,8 @@ class PumpPortalJitoSwapTester {
                 mint: tokenAddress,
                 denominatedInSol: "true",
                 amount: amountSOL.toFixed(9),
-                slippage: 10,
-                priorityFee: this.JITO_TIP_AMOUNT,
+                slippage: dynamicSlippage,
+                priorityFee: priorityFee, // Using dynamic priority fee
                 pool: "pump"
             },
             {
@@ -55,8 +160,8 @@ class PumpPortalJitoSwapTester {
                 mint: tokenAddress,
                 denominatedInSol: "true",
                 amount: amountSOL.toFixed(9),
-                slippage: 10,
-                priorityFee: 0,
+                slippage: dynamicSlippage,
+                priorityFee: 0, // Second transaction in bundle doesn't need priority fee
                 pool: "pump"
             }
         ];
