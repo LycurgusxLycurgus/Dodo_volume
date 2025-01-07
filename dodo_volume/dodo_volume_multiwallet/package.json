@@ -1,0 +1,22 @@
+{
+  "name": "volume-trader-bot",
+  "version": "1.0.0",
+  "description": "Solana Volume Trading Bot",
+  "main": "app_simple_volume_bot.js",
+  "scripts": {
+    "start": "node app_simple_volume_bot.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@project-serum/anchor": "^0.26.0",
+    "@solana/web3.js": "^1.87.0",
+    "bs58": "^5.0.0",
+    "cross-fetch": "^4.0.0",
+    "dotenv": "^16.3.1",
+    "prompts": "^2.4.2",
+    "winston": "^3.11.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
